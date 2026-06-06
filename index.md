@@ -36,7 +36,18 @@ Key EDA findings:
 
 ## Step 3: Missingness Assessment
 
-The dataset is essentially complete (1/114,000 rows missing). I argue the *hidden* missingness mechanism (which tracks even exist in the API scrape) is plausibly **NMAR**: very obscure tracks were under-sampled by the original collector, so absence from the dataset depends on the missing track's own (unobserved) popularity. Within the dataset itself, missingness is too sparse to support a meaningful permutation test against other columns.
+**NMAR (at the row level).** The dataset has almost no explicit `NaN`s (1/114,000 rows). But it is a *scrape* of Spotify, and which tracks exist at all is plausibly **NMAR**: very obscure tracks were under-sampled by the original collector, so a track's absence depends on its own (unobserved) popularity. To downgrade this to MAR we'd need Spotify's full internal catalog with play counts.
+
+**Encoded missingness (the real test).** The audio features carry *disguised* missingness: Spotify returns `tempo = 0`, `danceability = 0`, `time_signature = 0`, `valence = 0` when its audio-analysis pipeline fails. A literal 0 BPM tempo is physically meaningless — these are **sentinels for "analysis failed."** Exactly **157 tracks** share these sentinels, overwhelmingly `sleep`/`ambient` (138 of 157 are `sleep`) — beatless soundscapes.
+
+Treating `tempo == 0` as missing, two permutation tests (10,000 shuffles each) settle the mechanism:
+
+| Dependency tested | observed \|mean diff\| | p-value | verdict |
+|---|---|---|---|
+| tempo-missingness vs **`energy`** | 0.52 | ≈ 0.000 | **MAR** — strong dependency |
+| tempo-missingness vs **`key`** | 0.06 | ≈ 0.83 | independent (MCAR-like) |
+
+So tempo is **MAR**: its missingness depends on the *observed* `energy` (failed-analysis tracks are near-silent), not on the unobserved tempo value itself, and is unrelated to musical key (rhythm detection ⟂ pitch detection). These sentinel rows sit outside the 5-genre modeling subset, so they don't contaminate Steps 6–7.
 
 ---
 
@@ -58,7 +69,7 @@ The dataset is essentially complete (1/114,000 rows missing). I argue the *hidde
 - **Task:** Binary classification.
 - **Target:** `is_popular = (popularity >= 50)`.
 - **Features at prediction time:** audio features (danceability, energy, acousticness, instrumentalness, liveness, speechiness, valence, loudness, tempo), `duration_ms`, `explicit`, and `track_genre`. *Excluded* to avoid leakage: `popularity` itself.
-- **Primary metric:** F1 (positive class is 10–25% of tracks within each genre — accuracy is misleading). Secondary: ROC-AUC.
+- **Primary metric:** F1 (the positive "popular" class is 37.6% of the subset — imbalanced, so accuracy is misleading). Secondary: ROC-AUC.
 
 ---
 
@@ -76,20 +87,44 @@ This baseline is intentionally minimal — 2 features, no interactions, no regul
 
 ---
 
-## Step 7: Final Model (planned)
+## Step 7: Final Model
 
-For final submission I will:
+Over the baseline I added **all 9 audio features** plus `duration_ms` and `explicit`, and engineered two features:
 
-1. Add the remaining 9 audio + metadata features.
-2. Engineer two new features: `energy × danceability` interaction term and `log(duration_ms)`.
-3. Replace LogisticRegression with tree ensembles (`RandomForestClassifier`, `GradientBoostingClassifier`) and tune `n_estimators`, `max_depth`, `min_samples_leaf` via 5-fold `GridSearchCV` scored on F1.
+- `energy × danceability` — a multiplicative **interaction** (club/pop "hit" signature that a linear model can't represent on its own);
+- `log(duration_ms)` — tames the heavy right-skew from long classical/ambient pieces.
+
+Everything runs inside a single `Pipeline` (StandardScaler on quantitatives, one-hot on `track_genre`) so there's no train/test leakage. The estimator is a **`RandomForestClassifier`** tuned with 5-fold `GridSearchCV` (scored on F1) over `n_estimators ∈ {200, 400}`, `max_depth ∈ {None, 10, 20}`, `min_samples_leaf ∈ {1, 2, 5}`. A tuned `GradientBoostingClassifier` was compared and did not beat it.
+
+| Model | F1 | ROC-AUC | Accuracy |
+|---|---|---|---|
+| Baseline (LogReg, 2 features) | 0.6464 | 0.7755 | 0.6980 |
+| **Final (Random Forest)** | **0.8362** | **0.9249** | **0.8770** |
+
+That's a **+0.19 F1** and **+0.15 ROC-AUC** jump. Feature importances show the model leans on `loudness`, `energy`, `acousticness`, `instrumentalness`, and the engineered interaction — real within-genre audio signal, not just the genre one-hots.
 
 ---
 
-## Step 8: Fairness Analysis (planned)
+## Step 8: Fairness Analysis
 
-I will compare F1 on `explicit == True` vs `explicit == False` tracks via a permutation test, with H₀ that model performance is independent of explicit status.
+**Groups:** explicit vs. non-explicit tracks. **Metric:** precision of the "popular" prediction (a false "popular" flag wastes a promotion slot, so we care whether that error is borne unequally).
+
+- **H₀:** model precision is equal across explicit status (fair).
+- **H₁:** precision differs.
+- **Test statistic:** \|precision(explicit) − precision(non-explicit)\|; 10,000-shuffle permutation test, α = 0.05.
+
+**Result:** precision was 0.878 (explicit) vs 0.831 (non-explicit), an observed gap of **0.046** with **p ≈ 0.45**. We **fail to reject H₀** — no statistically significant evidence of unfairness w.r.t. explicit content. (Only ~110 test tracks are explicit, so the test has limited power; the conclusion is "no detectable unfairness," not "provably perfectly fair.")
 
 ---
 
-*This page is the Checkpoint 2 deliverable for DSC 80 Project 4. The full analysis notebook and code will be linked from this page at final submission.*
+## Summary
+
+| Step | Result |
+|---|---|
+| Hypothesis test | pop vs classical gap = 34.5, p ≈ 0 — genre carries strong signal |
+| Missingness | tempo-missingness is **MAR** (depends on `energy`, p ≈ 0; independent of `key`, p ≈ 0.83) |
+| Baseline | LogReg, F1 = 0.646 / ROC-AUC = 0.776 |
+| **Final model** | Random Forest, **F1 = 0.836 / ROC-AUC = 0.925 / acc = 0.877** |
+| Fairness | precision parity holds across `explicit` (gap 0.046, p ≈ 0.45) |
+
+*Full analysis notebook: [`proj04.ipynb`](./proj04.ipynb). DSC 80 Project 4, Spring 2026.*
